@@ -3,10 +3,10 @@ services:
     build: ./user-service
     image: user-service:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    networks: [app-net]
+    networks: [appnet]
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
-      interval: 15s
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
       timeout: 3s
       retries: 3
 
@@ -14,10 +14,10 @@ services:
     build: ./product-service
     image: product-service:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    networks: [app-net]
+    networks: [appnet]
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3002/health"]
-      interval: 15s
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
       timeout: 3s
       retries: 3
 
@@ -25,20 +25,10 @@ services:
     build: ./order-service
     image: order-service:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    environment:
-      - USER_SERVICE_URL=http://user-service:3001
-      - PRODUCT_SERVICE_URL=http://product-service:3002
-    volumes:
-      - order-data:/tmp
-    depends_on:
-      user-service:
-        condition: service_healthy
-      product-service:
-        condition: service_healthy
-    networks: [app-net]
+    networks: [appnet]
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3003/health"]
-      interval: 15s
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
       timeout: 3s
       retries: 3
 
@@ -48,16 +38,19 @@ services:
     ports:
       - "80:80"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - nginx_logs:/var/log/nginx
     depends_on:
-      - user-service
-      - product-service
-      - order-service
-    networks: [app-net]
+      user-service:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    networks: [appnet]
 
 networks:
-  app-net:
-    driver: bridge
+  appnet:
 
 volumes:
-  order-data:
+  nginx_logs:
