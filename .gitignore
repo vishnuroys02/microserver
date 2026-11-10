@@ -1,0 +1,11 @@
+node_modules/
+.env
+.deploy.env*
+*.pem
+*.key
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+tfplan
+registry.txt
