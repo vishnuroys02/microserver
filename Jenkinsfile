@@ -7,11 +7,15 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '10'))
   }
 
-  triggers { pollSCM('H/2 * * * *') }
+  triggers {
+    pollSCM('* * * * *')
+  }
 
   environment {
-    AWS_REGION = 'ap-south-1'
-    SERVICES   = 'user-service product-service order-service'
+    AWS_DEFAULT_REGION = 'ap-southeast-2'
+    REGISTRY           = '024899755048.dkr.ecr.ap-southeast-2.amazonaws.com'
+    EC2_HOST           = '32.236.188.119'
+    SERVICES           = 'user product order'
   }
 
   stages {
@@ -20,7 +24,7 @@ pipeline {
         checkout scm
         script {
           def sha = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          env.IMAGE_TAG = "v1.${BUILD_NUMBER}-${sha}"
+          env.IMAGE_TAG = "${env.BUILD_NUMBER}-${sha}"
         }
         echo "Image tag: ${env.IMAGE_TAG}"
       }
@@ -29,9 +33,9 @@ pipeline {
     stage('Validate Config') {
       steps {
         sh '''
-          export REGISTRY=dummy IMAGE_TAG=test GRAFANA_PASSWORD=dummy
-          docker compose -f docker-compose.yml config -q
-          docker compose -f docker-compose.prod.yml -f docker-compose.monitoring.yml config -q
+          REGISTRY=x IMAGE_TAG=y docker compose -f docker-compose.prod.yml config > /dev/null
+          docker compose -f docker-compose.yml config > /dev/null
+          echo "Compose files valid"
         '''
       }
     }
@@ -40,19 +44,18 @@ pipeline {
       steps {
         sh '''
           for s in $SERVICES; do
-            docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp \
-              -v "$PWD/$s":/app -w /app node:20-alpine \
-              sh -c "npm install --no-audit --no-fund && npm test"
+            echo "Testing $s-service"
+            docker run --rm -v "$PWD/$s-service":/app -w /app node:20-alpine npm test
           done
         '''
       }
     }
 
-    stage('Build & Tag') {
+    stage('Build and Tag') {
       steps {
         sh '''
           for s in $SERVICES; do
-            docker build -t $s:$IMAGE_TAG ./$s
+            docker build -t $REGISTRY/$s-service:$IMAGE_TAG ./$s-service
           done
         '''
       }
@@ -60,31 +63,33 @@ pipeline {
 
     stage('Push to ECR') {
       steps {
-        sh '''
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
-          for s in $SERVICES; do
-            docker tag $s:$IMAGE_TAG $REGISTRY/$s:$IMAGE_TAG
-            docker push $REGISTRY/$s:$IMAGE_TAG
-          done
-          echo $REGISTRY > registry.txt
-        '''
+        withCredentials([
+          string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+          string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+        ]) {
+          sh '''
+            aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REGISTRY
+            for s in $SERVICES; do
+              docker push $REGISTRY/$s-service:$IMAGE_TAG
+            done
+          '''
+        }
       }
     }
 
     stage('Deploy to EC2') {
       steps {
-        withCredentials([
-          sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'KEY', usernameVariable: 'SSH_USER'),
-          string(credentialsId: 'ec2-host', variable: 'EC2_HOST')
-        ]) {
+        script { env.DEPLOY_STARTED = 'true' }
+        sshagent(credentials: ['ec2-ssh-key']) {
           sh '''
-            REGISTRY=$(cat registry.txt)
-            OPTS="-o StrictHostKeyChecking=accept-new -i $KEY"
-            scp $OPTS docker-compose.prod.yml docker-compose.monitoring.yml scripts/deploy.sh scripts/verify.sh scripts/rollback.sh $SSH_USER@$EC2_HOST:/opt/app/
-            scp -r $OPTS nginx monitoring $SSH_USER@$EC2_HOST:/opt/app/
-            ssh $OPTS $SSH_USER@$EC2_HOST "bash /opt/app/deploy.sh $REGISTRY $IMAGE_TAG $AWS_REGION"
+            OPTS="-o StrictHostKeyChecking=accept-new"
+            ssh $OPTS ubuntu@$EC2_HOST "mkdir -p ~/app/nginx"
+            ssh $OPTS ubuntu@$EC2_HOST "cd ~/app && if [ -f .env ]; then cp .env .env.previous; fi"
+            scp $OPTS docker-compose.prod.yml ubuntu@$EC2_HOST:~/app/docker-compose.yml
+            scp $OPTS nginx/default.conf ubuntu@$EC2_HOST:~/app/nginx/default.conf
+            ssh $OPTS ubuntu@$EC2_HOST "cd ~/app && echo REGISTRY=$REGISTRY > .env && echo IMAGE_TAG=$IMAGE_TAG >> .env"
+            ssh $OPTS ubuntu@$EC2_HOST "cd ~/app && aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REGISTRY"
+            ssh $OPTS ubuntu@$EC2_HOST "cd ~/app && docker compose pull && docker compose up -d --remove-orphans"
           '''
         }
       }
@@ -92,19 +97,43 @@ pipeline {
 
     stage('Verify Deployment') {
       steps {
-        withCredentials([
-          sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'KEY', usernameVariable: 'SSH_USER'),
-          string(credentialsId: 'ec2-host', variable: 'EC2_HOST')
-        ]) {
-          sh 'ssh -o StrictHostKeyChecking=accept-new -i $KEY $SSH_USER@$EC2_HOST "bash /opt/app/verify.sh"'
-        }
+        sh '''
+          ok=0
+          for i in $(seq 1 12); do
+            if curl -fsS http://$EC2_HOST/health > /dev/null; then ok=1; break; fi
+            echo "Waiting for nginx... ($i)"
+            sleep 5
+          done
+          [ "$ok" = "1" ] || exit 1
+          for s in $SERVICES; do
+            curl -fsS http://$EC2_HOST/api/$s/health
+            echo
+          done
+        '''
       }
     }
   }
 
   post {
-    success { echo "Deployed ${env.IMAGE_TAG} successfully" }
-    failure { echo "Pipeline FAILED at tag ${env.IMAGE_TAG}. Rollback: ssh to EC2 and run: bash /opt/app/rollback.sh" }
-    always  { sh 'docker image prune -f || true' }
+    success {
+      echo "Deployed ${env.IMAGE_TAG} to ${env.EC2_HOST}"
+    }
+    failure {
+      script {
+        if (env.DEPLOY_STARTED == 'true') {
+          echo 'Deployment failed, rolling back to previous version'
+          sshagent(credentials: ['ec2-ssh-key']) {
+            sh '''
+              ssh -o StrictHostKeyChecking=accept-new ubuntu@$EC2_HOST "cd ~/app && if [ -f .env.previous ]; then cp .env.previous .env && docker compose up -d; else echo no previous version; fi"
+            '''
+          }
+        } else {
+          echo 'Failed before deployment, nothing to roll back'
+        }
+      }
+    }
+    always {
+      sh 'docker image prune -f || true'
+    }
   }
 }
